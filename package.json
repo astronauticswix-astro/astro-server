@@ -1,0 +1,16 @@
+{
+  "name": "astro-procurement-server",
+  "version": "3.0.0",
+  "description": "Backend for the Astronautics Procurement Intelligence interface — keeps the Claude API key server-side and serves live tenders. Created for Lior Marcus.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "dotenv": "^16.4.5"
+  }
+}
