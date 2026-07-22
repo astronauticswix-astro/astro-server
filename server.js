@@ -21,12 +21,14 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-5-20250929";
+const SAM_API_KEY = process.env.SAM_API_KEY || "";
+const TEAM_PASSWORD = process.env.TEAM_PASSWORD || "Astronautics2026"; // team gate for costly endpoints
 
 // Allow the browser interface to call this server (CORS) — safe here because
 // the key never leaves the server; the browser only receives finished results.
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Headers", "Content-Type");
+  res.header("Access-Control-Allow-Headers", "Content-Type, x-team-pass");
   res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   if (req.method === "OPTIONS") return res.sendStatus(200);
   next();
@@ -39,10 +41,25 @@ app.use(express.static(path.join(__dirname, "public")));
 /* ---------- Helper: robustly pull a JSON array out of model text ---------- */
 function extractJsonArray(text) {
   const cleaned = String(text || "").replace(/```json|```/g, "").trim();
-  const m = cleaned.match(/\[[\s\S]*\]/);
-  if (!m) throw new Error("No JSON array found in model output");
-  const arr = JSON.parse(m[0]);
-  if (!Array.isArray(arr)) throw new Error("Parsed payload is not an array");
+  const start = cleaned.indexOf("[");
+  if (start === -1) throw new Error("No JSON array found in model output");
+  let t = cleaned.slice(start);
+  const lastBr = t.lastIndexOf("]");
+  if (lastBr !== -1) {
+    try { const a = JSON.parse(t.slice(0, lastBr + 1)); if (Array.isArray(a)) return a; } catch (e) {}
+  }
+  // salvage a truncated reply: trim to the last complete top-level object
+  let depth = 0, inStr = false, esc = false, lastComplete = -1;
+  for (let i = 0; i < t.length; i++) {
+    const c = t[i];
+    if (inStr) { if (esc) { esc = false; } else if (c === "\\") { esc = true; } else if (c === '"') { inStr = false; } continue; }
+    if (c === '"') { inStr = true; continue; }
+    if (c === "{" || c === "[") depth++;
+    else if (c === "}" || c === "]") { depth--; if (depth === 1 && c === "}") lastComplete = i; }
+  }
+  if (lastComplete === -1) throw new Error("Model reply truncated before any complete item");
+  const arr = JSON.parse(t.slice(0, lastComplete + 1) + "]");
+  if (!Array.isArray(arr)) throw new Error("Salvaged payload is not an array");
   return arr;
 }
 
@@ -77,6 +94,16 @@ function sanitize(items, origin) {
     }));
 }
 
+/* ---------- Team password gate (protects credit-consuming endpoints) ---------- */
+function teamGate(req, res, next) {
+  const pass = req.headers["x-team-pass"] || req.query.pass || "";
+  if (pass !== TEAM_PASSWORD) {
+    return res.status(401).json({ error: "TEAM_PASSWORD_REQUIRED", detail: "Enter the team password in the \ud83d\udce1 panel of the interface." });
+  }
+  next();
+}
+app.use(["/api/tenders", "/api/official", "/api/ted"], teamGate);
+
 /* ---------- Health check: the source button pings this ---------- */
 app.get("/api/health", (req, res) => {
   res.json({
@@ -88,23 +115,19 @@ app.get("/api/health", (req, res) => {
 });
 
 /* ---------- Live tenders via Claude web search ---------- */
-app.get("/api/tenders", async (req, res) => {
-  if (!ANTHROPIC_API_KEY) {
-    return res.status(500).json({ error: "No API key configured on the server. Add ANTHROPIC_API_KEY to your .env file." });
-  }
-  // Optional filters passed from the interface
-  const cats = (req.query.cats || "").toString();
-  const srcs = (req.query.sources || "").toString();
+/* ---------- Cache + daily auto-refresh ---------- */
+const CACHE = { tenders: null, at: 0, params: "" };
+const DAY_MS = 24 * 60 * 60 * 1000;
 
+async function runLiveFetch(cats, srcs, geo) {
   const scope = cats
     ? cats
     : "avionics, cockpit/multifunction displays (AMLCD/MFD/head assembly), navigation (INS/EGI/anti-jam GPS/TACAN), mission computers, EFB, secure aircraft connectivity gateways, airborne network servers, avionics cybersecurity (ED-203A)";
   const srcLine = srcs ? ` Prioritize these portals/regions: ${srcs}.` : "";
 
-  const prompt = `Search the web for CURRENTLY OPEN, non-Israeli defence procurement tenders/RFPs/RFIs matching: ${scope}.${srcLine} Also match component nomenclature (AMLCD, display unit, head assembly, mission computer LRU, data concentrator) and non-English notices (German/French/Polish), translating titles to English. EXCLUDE Israeli sites/tenders. Only tenders published mid-2025 or later. Return ONLY a JSON array (no markdown, no prose) of up to 8 items, schema per item: {"id":"","refNo":"","title":"","source":"NATO|US DoD|EU|UK MOD|France|EDF|AU|CA|IN","sourceLong":"","org":"","location":"","cats":["subset of ${CATS.join(",")}"],"desc":"2-3 sentences","value":null,"valueDisplay":"","deadline":"YYYY-MM-DD or null","posted":"YYYY-MM-DD","status":"live|engage","elig":"open|indigenous|oem|consortium|registration","match":60-95,"keywords":[],"url":"","docs":[{"n":"filename"}],"notes":""}`;
+  const prompt = `Search the web for CURRENTLY OPEN, non-Israeli defence procurement tenders/RFPs/RFIs matching: ${scope}.${srcLine} Also match component nomenclature: AMLCD, display unit, head assembly, EFI, standby display, INS/EGI/IMU, ring laser gyro (RLG/MRLG), fiber optic gyro (FOG), accelerometers, GPS/INS with SAASM/M-Code, marine/submarine inertial navigation (AUV/ROV), land navigation & artillery fire-control, flight-control actuators, line-of-sight stabilization, position sensors, mission computer LRU, data concentrator; and non-English notices (German/French/Polish/Dutch/Spanish: licitación, aviónica, navegación inercial/Portuguese: licitação, pregão, edital, aviônica), translating titles to English. GEOGRAPHY RULES (mandatory): never include tenders from China, Russia, North Korea, or Israel. Exclude all Arab countries EXCEPT the United Arab Emirates and Saudi Arabia (permitted, no special emphasis). African countries are LOW priority.${geo ? " FOCUS regions: " + geo + "." : ""} ALSO SEARCH publicly posted supplier/subcontract opportunities, RFQs and industry days from major defence primes (Boeing, Airbus, Lockheed Martin, RTX/Collins, Northrop, BAE, Thales, Leonardo, Rheinmetall, Saab, GD, L3Harris, Embraer, Hanwha/KAI, MHI) — mark these status engage and note the prime. EXCLUDE Israeli sites/tenders. Only tenders published mid-2025 or later. Return ONLY a JSON array (no markdown, no prose) of up to 8 items, schema per item: {"id":"","refNo":"","title":"","source":"NATO|US DoD|EU|UK MOD|France|EDF|AU|CA|IN","sourceLong":"","org":"","location":"","cats":["subset of ${CATS.join(",")}"],"desc":"2-3 sentences","value":null,"valueDisplay":"","deadline":"YYYY-MM-DD or null","posted":"YYYY-MM-DD","status":"live|engage","elig":"open|indigenous|oem|consortium|registration","match":60-95,"keywords":[],"url":"","docs":[{"n":"filename"}],"notes":""}`;
 
-  try {
-    const r = await fetch("https://api.anthropic.com/v1/messages", {
+  const r = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "x-api-key": ANTHROPIC_API_KEY,          // <-- the key stays here, on the server
@@ -113,21 +136,179 @@ app.get("/api/tenders", async (req, res) => {
       },
       body: JSON.stringify({
         model: ANTHROPIC_MODEL,
-        max_tokens: 2000,
+        max_tokens: 8000,
         messages: [{ role: "user", content: prompt }],
         tools: [{ type: "web_search_20250305", name: "web_search" }]
       })
     });
     if (!r.ok) {
       const body = await r.text();
-      return res.status(502).json({ error: "Claude API error " + r.status, detail: body.slice(0,300) });
+      throw new Error("Claude API error " + r.status + ": " + body.slice(0, 200));
     }
     const data = await r.json();
     const text = (data.content || []).filter(b => b.type === "text").map(b => b.text).join("\n");
     const items = sanitize(extractJsonArray(text), "live");
-    res.json({ ok: true, count: items.length, tenders: items, fetchedAt: new Date().toISOString() });
+    // Also pull from official portal APIs (UK FTS always; SAM.gov when key configured)
+    let officialItems = [], officialErrors = [];
+    try {
+      const kw = cats ? cats.split(",").map(x=>x.trim()).filter(Boolean) : null;
+      const o = await fetchOfficialAPIs(kw);
+      officialItems = sanitize(o.items, "live");
+      officialErrors = o.errors;
+    } catch (e) { officialErrors = [String(e.message || e)]; }
+    // merge + dedupe by title
+    const seenT = new Set(items.map(t => t.title.toLowerCase().replace(/[^a-z0-9]/g,"")));
+    const merged = items.concat(officialItems.filter(t => !seenT.has(t.title.toLowerCase().replace(/[^a-z0-9]/g,""))));
+    return { ok: true, count: merged.length, tenders: merged, sources: { claude: items.length, officialApis: merged.length - items.length }, officialErrors, fetchedAt: new Date().toISOString() };
+}
+
+app.get("/api/tenders", async (req, res) => {
+  if (!ANTHROPIC_API_KEY) {
+    return res.status(500).json({ error: "No API key configured on the server. Add ANTHROPIC_API_KEY to your .env file." });
+  }
+  const cats = (req.query.cats || "").toString();
+  const srcs = (req.query.sources || "").toString();
+  const geo = (req.query.geo || "").toString();
+  const force = req.query.force === "1";
+  const pkey = cats + "|" + srcs + "|" + geo;
+  const fresh = CACHE.tenders && (Date.now() - CACHE.at < DAY_MS) && CACHE.params === pkey;
+  if (fresh && !force) {
+    return res.json({ ...CACHE.tenders, cached: true, cacheAgeMinutes: Math.round((Date.now() - CACHE.at) / 60000) });
+  }
+  try {
+    const out = await runLiveFetch(cats, srcs, geo);
+    CACHE.tenders = out; CACHE.at = Date.now(); CACHE.params = pkey;
+    res.json({ ...out, cached: false });
   } catch (err) {
+    // serve stale cache on failure rather than erroring out
+    if (CACHE.tenders) return res.json({ ...CACHE.tenders, cached: true, stale: true, fetchError: String(err.message || err) });
     res.status(500).json({ error: "Server failed to fetch tenders", detail: String(err.message || err) });
+  }
+});
+
+/* Daily self-refresh: keeps the cache warm so every file open shows fresh data */
+function scheduledRefresh() {
+  if (!ANTHROPIC_API_KEY) return;
+  runLiveFetch("", "", "").then(out => {
+    CACHE.tenders = out; CACHE.at = Date.now(); CACHE.params = "||";
+    console.log("[cron] daily refresh done — " + out.count + " tenders @ " + new Date().toISOString());
+  }).catch(e => console.warn("[cron] daily refresh failed: " + (e.message || e)));
+}
+setTimeout(scheduledRefresh, 30 * 1000);           // warm-up shortly after boot
+setInterval(scheduledRefresh, DAY_MS);              // then once a day
+
+/* =========================================================================
+   OFFICIAL PORTAL APIs — direct "service doors" that bypass web indexing.
+   These turn PARTIAL-indexed portals into properly covered sources.
+   Each fetcher is best-effort: a failure in one source never blocks others.
+   ========================================================================= */
+
+const DEFAULT_KEYWORDS = ["avionics","multifunction display","inertial navigation","mission computer","TACAN","electronic flight bag"];
+
+/* UK Find a Tender — public OCDS API, no key required */
+async function fetchUKFTS(keyword) {
+  const url = "https://www.find-tender.service.gov.uk/api/1.0/ocdsReleasePackages?limit=10&stages=tender&keywords=" + encodeURIComponent(keyword);
+  const r = await fetch(url, { headers: { "accept": "application/json" } });
+  if (!r.ok) throw new Error("UK FTS " + r.status);
+  const data = await r.json();
+  const out = [];
+  for (const pkg of (data.results || data.releasePackages || [])) {
+    const rel = (pkg.releases && pkg.releases[0]) || pkg;
+    const t = rel.tender || {};
+    if (!t.title) continue;
+    out.push({
+      id: "UKFTS-" + String(rel.ocid || t.id || Math.random().toString(36).slice(2)).slice(-24),
+      refNo: String(rel.ocid || t.id || "—"),
+      title: t.title,
+      source: "UK MOD",
+      sourceLong: "UK Find a Tender (official API)",
+      org: (rel.buyer && rel.buyer.name) || "—",
+      location: "United Kingdom",
+      cats: [],
+      desc: String(t.description || "").slice(0, 500),
+      value: (t.value && typeof t.value.amount === "number") ? t.value.amount : null,
+      valueDisplay: (t.value && t.value.amount) ? ("≈ " + (t.value.currency || "GBP") + " " + t.value.amount.toLocaleString()) : "TBD",
+      deadline: (t.tenderPeriod && t.tenderPeriod.endDate) ? String(t.tenderPeriod.endDate).slice(0,10) : null,
+      posted: rel.date ? String(rel.date).slice(0,10) : null,
+      status: "live",
+      match: 65,
+      keywords: [keyword],
+      url: "https://www.find-tender.service.gov.uk/Search/Results?Keywords=" + encodeURIComponent(keyword),
+      docs: [],
+      notes: "Fetched via the official UK FTS OCDS API — verify details on the notice page."
+    });
+  }
+  return out;
+}
+
+/* SAM.gov Opportunities — official API, requires a FREE key (SAM_API_KEY in .env) */
+async function fetchSAMgov(keyword) {
+  if (!SAM_API_KEY) return []; // silently skip when no key configured
+  const today = new Date(); const from = new Date(today); from.setMonth(from.getMonth() - 2);
+  const fmt = d => String(d.getMonth()+1).padStart(2,"0") + "/" + String(d.getDate()).padStart(2,"0") + "/" + d.getFullYear();
+  const url = "https://api.sam.gov/opportunities/v2/search?api_key=" + encodeURIComponent(SAM_API_KEY)
+    + "&keywords=" + encodeURIComponent(keyword)
+    + "&postedFrom=" + fmt(from) + "&postedTo=" + fmt(today)
+    + "&ptype=o,p,r&limit=10";
+  const r = await fetch(url);
+  if (!r.ok) throw new Error("SAM.gov " + r.status);
+  const data = await r.json();
+  const out = [];
+  for (const o of (data.opportunitiesData || [])) {
+    if (!o.title) continue;
+    out.push({
+      id: "SAM-" + String(o.noticeId || Math.random().toString(36).slice(2)).slice(-24),
+      refNo: String(o.solicitationNumber || o.noticeId || "—"),
+      title: o.title,
+      source: "US DoD",
+      sourceLong: "SAM.gov (official API)",
+      org: String(o.fullParentPathName || o.departmentName || "—").split(".").slice(-1)[0],
+      location: "United States",
+      cats: [],
+      desc: String(o.description || o.title).slice(0, 500),
+      value: null,
+      valueDisplay: "See notice",
+      deadline: o.responseDeadLine ? String(o.responseDeadLine).slice(0,10) : null,
+      posted: o.postedDate ? String(o.postedDate).slice(0,10) : null,
+      status: "live",
+      match: 65,
+      keywords: [keyword],
+      url: o.uiLink || ("https://sam.gov/opp/" + o.noticeId + "/view"),
+      docs: [],
+      notes: "Fetched via the official SAM.gov Opportunities API — verify details on the notice page."
+    });
+  }
+  return out;
+}
+
+/* Merge official-API results for a set of keywords; failures never block */
+async function fetchOfficialAPIs(keywords) {
+  const kws = (keywords && keywords.length ? keywords : DEFAULT_KEYWORDS).slice(0, 4);
+  const jobs = [];
+  for (const k of kws) { jobs.push(fetchUKFTS(k)); jobs.push(fetchSAMgov(k)); }
+  const settled = await Promise.allSettled(jobs);
+  const items = [], errors = [];
+  for (const sres of settled) {
+    if (sres.status === "fulfilled") items.push(...sres.value);
+    else errors.push(String(sres.reason && sres.reason.message || sres.reason));
+  }
+  // dedupe by normalized title
+  const seen = new Set(); const dedup = [];
+  for (const it of items) {
+    const key = it.title.toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (seen.has(key)) continue; seen.add(key); dedup.push(it);
+  }
+  return { items: dedup, errors };
+}
+
+/* ---------- Official-APIs endpoint (no Claude, no Anthropic key needed) ---------- */
+app.get("/api/official", async (req, res) => {
+  const kws = (req.query.q || "").toString().split(",").map(x => x.trim()).filter(Boolean);
+  try {
+    const { items, errors } = await fetchOfficialAPIs(kws);
+    res.json({ ok: true, count: items.length, tenders: sanitize(items, "live"), samKeyConfigured: !!SAM_API_KEY, errors });
+  } catch (err) {
+    res.status(500).json({ error: "Official API fetch failed", detail: String(err.message || err) });
   }
 });
 
