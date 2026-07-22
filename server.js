@@ -115,6 +115,51 @@ app.get("/api/health", (req, res) => {
 });
 
 /* ---------- Live tenders via Claude web search ---------- */
+/* ---------- Data-quality verification engine ---------- */
+const VERIFY_LOG = {}; // id -> { status, checkedAt, note, correctedDeadline, correctedStatus }
+
+async function aiVerifyTender(t) {
+  if (!ANTHROPIC_API_KEY) throw new Error("No API key configured");
+  const prompt = `Fact-check ONE government/defence tender record against real, current web sources. Record: title="${t.title}", claimed deadline="${t.deadline || "none"}", claimed status="${t.status}", source URL="${t.url}", org="${t.org || ""}".
+Search the web to confirm: (1) does this programme/tender genuinely exist, (2) is the claimed deadline accurate, (3) is it still open or has it closed/been awarded.
+Return ONLY a JSON object (no markdown, no prose): {"verdict":"confirmed|corrected|not_found","realDeadline":"YYYY-MM-DD or null","realStatus":"live|engage|closed","note":"max 2 sentences citing what you found"}`;
+  const r = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+    body: JSON.stringify({ model: ANTHROPIC_MODEL, max_tokens: 1000,
+      messages: [{ role: "user", content: prompt }],
+      tools: [{ type: "web_search_20250305", name: "web_search" }] })
+  });
+  if (!r.ok) throw new Error("Claude API error " + r.status);
+  const data = await r.json();
+  const text = (data.content || []).filter(b => b.type === "text").map(b => b.text).join("\n");
+  const cleaned = text.replace(/```json|```/g, "").trim();
+  const m = cleaned.match(/\{[\s\S]*\}/);
+  if (!m) throw new Error("No JSON object in verification reply");
+  const v = JSON.parse(m[0]);
+  return {
+    status: v.verdict === "confirmed" ? "confirmed" : (v.verdict === "corrected" ? "corrected" : "not_found"),
+    checkedAt: new Date().toISOString(),
+    note: String(v.note || "").slice(0, 300),
+    correctedDeadline: v.realDeadline || null,
+    correctedStatus: v.realStatus || null
+  };
+}
+
+app.post("/api/verify-tender", teamGate, express.json(), async (req, res) => {
+  const t = req.body || {};
+  if (!t.id || !t.title || !t.url) return res.status(400).json({ error: "id, title and url are required" });
+  try {
+    const result = await aiVerifyTender(t);
+    VERIFY_LOG[t.id] = result;
+    res.json({ ok: true, id: t.id, ...result });
+  } catch (err) {
+    res.status(500).json({ error: "Verification failed", detail: String(err.message || err) });
+  }
+});
+
+app.get("/api/verify-status", (req, res) => { res.json({ ok: true, log: VERIFY_LOG }); });
+
 /* ---------- Cache + daily auto-refresh ---------- */
 const CACHE = { tenders: null, at: 0, params: "" };
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -173,12 +218,12 @@ app.get("/api/tenders", async (req, res) => {
   const pkey = cats + "|" + srcs + "|" + geo;
   const fresh = CACHE.tenders && (Date.now() - CACHE.at < DAY_MS) && CACHE.params === pkey;
   if (fresh && !force) {
-    return res.json({ ...CACHE.tenders, cached: true, cacheAgeMinutes: Math.round((Date.now() - CACHE.at) / 60000) });
+    return res.json({ ...CACHE.tenders, cached: true, cacheAgeMinutes: Math.round((Date.now() - CACHE.at) / 60000), verifyLog: VERIFY_LOG });
   }
   try {
     const out = await runLiveFetch(cats, srcs, geo);
     CACHE.tenders = out; CACHE.at = Date.now(); CACHE.params = pkey;
-    res.json({ ...out, cached: false });
+    res.json({ ...out, cached: false, verifyLog: VERIFY_LOG });
   } catch (err) {
     // serve stale cache on failure rather than erroring out
     if (CACHE.tenders) return res.json({ ...CACHE.tenders, cached: true, stale: true, fetchError: String(err.message || err) });
@@ -189,9 +234,23 @@ app.get("/api/tenders", async (req, res) => {
 /* Daily self-refresh: keeps the cache warm so every file open shows fresh data */
 function scheduledRefresh() {
   if (!ANTHROPIC_API_KEY) return;
-  runLiveFetch("", "", "").then(out => {
+  runLiveFetch("", "", "").then(async out => {
     CACHE.tenders = out; CACHE.at = Date.now(); CACHE.params = "||";
     console.log("[cron] daily refresh done — " + out.count + " tenders @ " + new Date().toISOString());
+    // Auto-verification sweep: pick the 3 stalest-unverified tenders and fact-check them
+    try {
+      const candidates = (out.tenders || [])
+        .filter(t => !VERIFY_LOG[t.id])
+        .sort((a, b) => new Date(a.posted || 0) - new Date(b.posted || 0))
+        .slice(0, 3);
+      for (const t of candidates) {
+        try {
+          const result = await aiVerifyTender(t);
+          VERIFY_LOG[t.id] = result;
+          console.log("[cron] verified " + t.id + " -> " + result.status);
+        } catch (e) { console.warn("[cron] verify failed for " + t.id + ": " + (e.message || e)); }
+      }
+    } catch (e) { console.warn("[cron] verification sweep failed: " + (e.message || e)); }
   }).catch(e => console.warn("[cron] daily refresh failed: " + (e.message || e)));
 }
 setTimeout(scheduledRefresh, 30 * 1000);           // warm-up shortly after boot
