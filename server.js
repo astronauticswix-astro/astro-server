@@ -23,6 +23,28 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-5-20250929";
 const SAM_API_KEY = process.env.SAM_API_KEY || "";
 const TEAM_PASSWORD = process.env.TEAM_PASSWORD || "Astronautics2026"; // team gate for costly endpoints
+const BUDGET_USD = parseFloat(process.env.BUDGET_USD || "20"); // matches your Anthropic console spend limit — change via env var if you raise it
+
+/* ---------- Usage estimator (best-effort; resets on server restart) ----------
+   Anthropic returns exact token counts per call (data.usage). We accumulate
+   an ESTIMATED cost from those — this is NOT the authoritative billing figure,
+   which always lives at console.anthropic.com/settings/billing. */
+const USAGE = { inputTokens: 0, outputTokens: 0, calls: 0, since: new Date().toISOString() };
+// Approximate Claude Sonnet pricing per million tokens (verify current rates in the console) — https://www.anthropic.com/pricing
+const PRICE_IN_PER_M = 3.0, PRICE_OUT_PER_M = 15.0;
+function trackUsage(data) {
+  const u = data && data.usage;
+  if (!u) return;
+  USAGE.inputTokens += (u.input_tokens || 0);
+  USAGE.outputTokens += (u.output_tokens || 0);
+  USAGE.calls += 1;
+}
+function usageSnapshot() {
+  const estSpendUSD = (USAGE.inputTokens / 1e6) * PRICE_IN_PER_M + (USAGE.outputTokens / 1e6) * PRICE_OUT_PER_M;
+  const pct = BUDGET_USD > 0 ? Math.min(999, Math.round((estSpendUSD / BUDGET_USD) * 100)) : 0;
+  return { estSpendUSD: Math.round(estSpendUSD * 100) / 100, budgetUSD: BUDGET_USD, percentUsed: pct, calls: USAGE.calls, since: USAGE.since, note: "Estimate only, resets on server restart. Authoritative balance: console.anthropic.com/settings/billing" };
+}
+app.get("/api/usage", teamGate, (req, res) => { res.json({ ok: true, ...usageSnapshot() }); });
 
 // Allow the browser interface to call this server (CORS) — safe here because
 // the key never leaves the server; the browser only receives finished results.
@@ -133,6 +155,7 @@ Return ONLY a JSON object (no markdown, no prose): {"verdict":"confirmed|correct
   });
   if (!r.ok) throw new Error("Claude API error " + r.status);
   const data = await r.json();
+  trackUsage(data);
   const text = (data.content || []).filter(b => b.type === "text").map(b => b.text).join("\n");
   const cleaned = text.replace(/```json|```/g, "").trim();
   const m = cleaned.match(/\{[\s\S]*\}/);
@@ -192,6 +215,7 @@ async function runLiveFetch(cats, srcs, geo) {
       throw new Error("Claude API error " + r.status + ": " + body.slice(0, 200));
     }
     const data = await r.json();
+    trackUsage(data);
     const text = (data.content || []).filter(b => b.type === "text").map(b => b.text).join("\n");
     const items = sanitize(extractJsonArray(text), "live");
     // Also pull from official portal APIs (UK FTS always; SAM.gov when key configured)
